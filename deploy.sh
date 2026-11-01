@@ -5,6 +5,7 @@ set -euo pipefail
 PROJECT=dresscode-social
 REGION=europe-west1
 BUCKET=${PROJECT}-media
+STATE=${PROJECT}-state
 SA=mushtariy-mcp@${PROJECT}.iam.gserviceaccount.com
 
 gcloud config set project "$PROJECT"
@@ -19,35 +20,35 @@ gcloud storage buckets add-iam-policy-binding gs://$BUCKET --member=allUsers --r
 echo '{"rule":[{"action":{"type":"Delete"},"condition":{"age":30,"matchesPrefix":["media/"]}}]}' > /tmp/lc.json
 gcloud storage buckets update gs://$BUCKET --lifecycle-file=/tmp/lc.json
 
+gcloud storage buckets describe gs://$STATE >/dev/null 2>&1 || \
+  gcloud storage buckets create gs://$STATE --location=$REGION --uniform-bucket-level-access --public-access-prevention
+
 # Service account the server runs as
 gcloud iam service-accounts describe $SA >/dev/null 2>&1 || \
   gcloud iam service-accounts create mushtariy-mcp --display-name="Mushtariy MCP"
-gcloud storage buckets add-iam-policy-binding gs://$BUCKET --member=serviceAccount:$SA --role=roles/storage.objectAdmin
-
-# Generated secrets (random, never shown in chat)
-for S in MCP_PATH_TOKEN QUEUE_TOKEN; do
-  gcloud secrets describe $S >/dev/null 2>&1 || \
-    python3 -c "import secrets;print(secrets.token_urlsafe(32),end='')" | gcloud secrets create $S --data-file=-
+for B in $BUCKET $STATE; do
+  gcloud storage buckets add-iam-policy-binding gs://$B --member=serviceAccount:$SA --role=roles/storage.objectAdmin
 done
+
 # META_ACCESS_TOKEN and IG_USER_ID are added by you in Secret Manager (see README)
-for S in MCP_PATH_TOKEN QUEUE_TOKEN META_ACCESS_TOKEN IG_USER_ID; do
+for S in META_ACCESS_TOKEN IG_USER_ID; do
   gcloud secrets add-iam-policy-binding $S --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor >/dev/null
 done
 
 gcloud run deploy mushtariy-mcp --source . --region=$REGION --service-account=$SA \
   --allow-unauthenticated --min-instances=0 --max-instances=1 --memory=512Mi --timeout=900 \
-  --set-env-vars=MEDIA_BUCKET=$BUCKET \
-  --set-secrets=MCP_PATH_TOKEN=MCP_PATH_TOKEN:latest,QUEUE_TOKEN=QUEUE_TOKEN:latest,META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,IG_USER_ID=IG_USER_ID:latest
+  --set-env-vars=MEDIA_BUCKET=$BUCKET,STATE_BUCKET=$STATE \
+  --set-secrets=META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,IG_USER_ID=IG_USER_ID:latest
 
 URL=$(gcloud run services describe mushtariy-mcp --region=$REGION --format='value(status.url)')
 
 # Publish due scheduled posts every 5 minutes
-QT=$(gcloud secrets versions access latest --secret=QUEUE_TOKEN)
 gcloud scheduler jobs describe mushtariy-queue --location=$REGION >/dev/null 2>&1 && \
   gcloud scheduler jobs delete mushtariy-queue --location=$REGION --quiet
 gcloud scheduler jobs create http mushtariy-queue --location=$REGION --schedule="*/5 * * * *" \
-  --uri="$URL/run-queue" --http-method=POST --headers="x-queue-token=$QT"
+  --uri="$URL/run-queue" --http-method=POST
 
 echo
 echo "Connector URL (keep private — it is the key):"
-echo "$URL/mcp/$(gcloud secrets versions access latest --secret=MCP_PATH_TOKEN)"
+curl -s "$URL/health" >/dev/null   # first request creates the path token
+echo "$URL/mcp/$(gcloud storage cat gs://$STATE/config/mcp_path_token)"

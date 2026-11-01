@@ -6,8 +6,10 @@ An MCP server that lets Claude publish to **@mushtariy.beta** through Meta's off
 
 **Rules built in:**
 - Every post is sent with the AI-generated flag (`is_ai_generated=true`).
-- Media is copied into the public bucket `dresscode-social-media` before publishing. Copies are auto-deleted after 30 days.
-- Scheduled posts sit in `gs://dresscode-social-media/queue/`. Cloud Scheduler calls `/run-queue` every 5 minutes to publish whatever is due.
+- Media is copied into the **public** bucket `dresscode-social-media` before publishing.
+- Scheduled posts and the connector's secret path live in the **private** bucket `dresscode-social-state` (`queue/`, `config/mcp_path_token`). Cloud Scheduler calls `/run-queue` every 5 minutes to publish whatever is due.
+- Runs as the service account `mushtariy-mcp`. Secrets in Secret Manager: `META_ACCESS_TOKEN` and `IG_USER_ID`.
+- The connector URL is `<service-url>/mcp/<contents of gs://dresscode-social-state/config/mcp_path_token>`. To rotate it, delete that object and redeploy.
 
 ## Setup (once)
 
@@ -19,7 +21,7 @@ An MCP server that lets Claude publish to **@mushtariy.beta** through Meta's off
    - Create the secret `META_ACCESS_TOKEN` and paste the Page token into it.
    - Create the secret `IG_USER_ID` and paste the id into it.
    - Never paste either one into a chat.
-3. **Cloud Shell.** Run `git clone https://github.com/Nozima-Rustamova2/mushtariy && cd mushtariy && bash deploy.sh`.
+3. **Deploy.** Either run `bash deploy.sh` in Cloud Shell, or deploy through the console (Cloud Run → connect this repo, Dockerfile build) with env `MEDIA_BUCKET`, `STATE_BUCKET` and the two secrets as env vars.
 4. **Connect it.** Add the printed URL in claude.ai under Settings → Connectors → Add custom connector.
 
-The secret path in the URL is the only key. If it leaks, add a new version of `MCP_PATH_TOKEN` and redeploy.
+The secret path in the URL is the only key. If it leaks, rotate it as described above.

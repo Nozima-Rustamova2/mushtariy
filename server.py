@@ -31,16 +31,39 @@ GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v24.0")
 GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
 ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")  # long-lived Page token (Secret Manager)
 IG_USER_ID = os.environ.get("IG_USER_ID", "")  # Instagram professional account id
-BUCKET = os.environ.get("MEDIA_BUCKET", "")  # public GCS bucket for media
+BUCKET = os.environ.get("MEDIA_BUCKET", "")  # PUBLIC bucket: media Meta fetches by URL
+STATE_BUCKET = os.environ.get("STATE_BUCKET", "")  # PRIVATE bucket: post queue + server config
 MCP_PATH_TOKEN = os.environ.get("MCP_PATH_TOKEN", "")  # secret path segment for the connector URL
-QUEUE_TOKEN = os.environ.get("QUEUE_TOKEN", "")  # header secret Cloud Scheduler sends
 # Field Meta uses for the AI-generated disclosure. Kept configurable in case Meta renames it.
 AI_LABEL_PARAM = os.environ.get("AI_LABEL_PARAM", "is_ai_generated")
 
+
+
+def _state_bucket():
+    from google.cloud import storage
+
+    return storage.Client().bucket(STATE_BUCKET)
+
+
+def _bootstrap_path_token() -> str:
+    """The connector URL's secret segment. Generated once and kept in the private bucket
+    (config/mcp_path_token), so nobody has to type a secret anywhere. Rotate it by
+    deleting that object and restarting the service."""
+    if not STATE_BUCKET:
+        print("STATE_BUCKET not set; using a throwaway path token for this process.")
+        return secrets.token_urlsafe(24)
+    from google.api_core.exceptions import PreconditionFailed
+
+    blob = _state_bucket().blob("config/mcp_path_token")
+    try:
+        blob.upload_from_string(secrets.token_urlsafe(32), if_generation_match=0)
+    except PreconditionFailed:
+        pass  # already exists
+    return blob.download_as_text().strip()
+
+
 if not MCP_PATH_TOKEN:
-    # Never serve the tools on a guessable URL.
-    MCP_PATH_TOKEN = secrets.token_urlsafe(24)
-    print("MCP_PATH_TOKEN not set; generated a throwaway one for this process.")
+    MCP_PATH_TOKEN = _bootstrap_path_token()
 
 mcp = FastMCP(
     name="mushtariy-instagram",
@@ -237,9 +260,7 @@ POST_KINDS = {"photo", "carousel", "reel", "story"}
 
 
 def _queue_blobs():
-    from google.cloud import storage
-
-    return storage.Client().bucket(BUCKET).list_blobs(prefix="queue/")
+    return _state_bucket().list_blobs(prefix="queue/")
 
 
 @mcp.tool()
@@ -260,9 +281,7 @@ async def schedule_post(kind: str, publish_at_iso: str, args: dict) -> dict:
     job = {"id": uuid.uuid4().hex[:10], "kind": kind, "at": when.astimezone(timezone.utc).isoformat(), "args": args}
 
     def _save() -> None:
-        from google.cloud import storage
-
-        storage.Client().bucket(BUCKET).blob(f"queue/{job['id']}.json").upload_from_string(
+        _state_bucket().blob(f"queue/{job['id']}.json").upload_from_string(
             json.dumps(job), content_type="application/json"
         )
 
@@ -282,9 +301,7 @@ async def list_scheduled() -> list[dict]:
 async def cancel_scheduled(job_id: str) -> dict:
     """Remove a queued post by its id."""
     def _del() -> None:
-        from google.cloud import storage
-
-        storage.Client().bucket(BUCKET).blob(f"queue/{job_id}.json").delete()
+        _state_bucket().blob(f"queue/{job_id}.json").delete()
 
     await asyncio.to_thread(_del)
     return {"cancelled": job_id}
@@ -296,24 +313,42 @@ async def _run(kind: str, args: dict) -> dict:
 
 
 @mcp.custom_route("/run-queue", methods=["POST"])
-async def run_queue(request: Request) -> JSONResponse:
-    """Called by Cloud Scheduler every few minutes; publishes whatever is due."""
-    if not QUEUE_TOKEN or not secrets.compare_digest(request.headers.get("x-queue-token", ""), QUEUE_TOKEN):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+async def run_queue(_: Request) -> JSONResponse:
+    """Called by Cloud Scheduler every 5 minutes; publishes whatever is due.
+
+    Needs no secret: it can only publish posts that were already queued through the
+    (secret-URL) MCP endpoint, and only once they are due. Each job is claimed with a
+    create-only lock object first, so overlapping calls can't publish a post twice."""
+    from google.api_core.exceptions import PreconditionFailed
+
     now = datetime.now(timezone.utc)
     results = []
     for blob in await asyncio.to_thread(lambda: list(_queue_blobs())):
-        job = json.loads(blob.download_as_text())
+        job = json.loads(await asyncio.to_thread(blob.download_as_text))
         if datetime.fromisoformat(job["at"]) > now:
             continue
+        lock = _state_bucket().blob(f"running/{job['id']}")
+        try:
+            await asyncio.to_thread(lock.upload_from_string, now.isoformat(), if_generation_match=0)
+        except PreconditionFailed:
+            continue  # another run has it
         try:
             out = await _run(job["kind"], job["args"])
             await asyncio.to_thread(blob.delete)
             results.append({"id": job["id"], "ok": True, "permalink": out.get("permalink")})
         except Exception as e:  # keep the job for the next run, record the error
             job["last_error"] = str(e)
-            await asyncio.to_thread(blob.upload_from_string, json.dumps(job), content_type="application/json")
+            job["attempts"] = job.get("attempts", 0) + 1
+            if job["attempts"] >= 3:
+                await asyncio.to_thread(
+                    _state_bucket().blob(f"failed/{job['id']}.json").upload_from_string, json.dumps(job)
+                )
+                await asyncio.to_thread(blob.delete)
+            else:
+                await asyncio.to_thread(blob.upload_from_string, json.dumps(job), content_type="application/json")
             results.append({"id": job["id"], "ok": False, "error": str(e)})
+        finally:
+            await asyncio.to_thread(lock.delete)
     return JSONResponse({"ran": results})
 
 
