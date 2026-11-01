@@ -31,8 +31,12 @@ GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v24.0")
 GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
 ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")  # long-lived Page token (Secret Manager)
 IG_USER_ID = os.environ.get("IG_USER_ID", "")  # Instagram professional account id
-BUCKET = os.environ.get("MEDIA_BUCKET", "")  # PUBLIC bucket: media Meta fetches by URL
-STATE_BUCKET = os.environ.get("STATE_BUCKET", "")  # PRIVATE bucket: post queue + server config
+# One PRIVATE bucket: media/ (served to Meta through this service), queue/, config/.
+BUCKET = os.environ.get("BUCKET", "")
+STATE_BUCKET = BUCKET
+# Public base URL of this service, used to build media links Meta can fetch.
+# Learned from the first incoming request if not set.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 MCP_PATH_TOKEN = os.environ.get("MCP_PATH_TOKEN", "")  # secret path segment for the connector URL
 # Field Meta uses for the AI-generated disclosure. Kept configurable in case Meta renames it.
 AI_LABEL_PARAM = os.environ.get("AI_LABEL_PARAM", "is_ai_generated")
@@ -135,14 +139,35 @@ def labelled(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------- media staging
+# Media stays in the private bucket. This service serves it at /m/<random-name>, which is
+# the URL handed to Meta. Names are 128-bit random, so links can't be guessed.
 
 
 def _public_url(blob_name: str) -> str:
-    return f"https://storage.googleapis.com/{BUCKET}/{blob_name}"
+    if not PUBLIC_BASE_URL:
+        raise GraphError("Service URL not known yet; set PUBLIC_BASE_URL.")
+    return f"{PUBLIC_BASE_URL}/m/{blob_name.removeprefix('media/')}"
 
 
 def _is_our_bucket(url: str) -> bool:
-    return bool(BUCKET) and url.startswith(f"https://storage.googleapis.com/{BUCKET}/")
+    return bool(PUBLIC_BASE_URL) and url.startswith(f"{PUBLIC_BASE_URL}/m/")
+
+
+@mcp.custom_route("/m/{name:path}", methods=["GET", "HEAD"])
+async def serve_media(request: Request):
+    from starlette.responses import Response
+
+    name = request.path_params["name"]
+    if ".." in name or not name:
+        return Response(status_code=404)
+    blob = _state_bucket().blob(f"media/{name}")
+    try:
+        data = await asyncio.to_thread(blob.download_as_bytes)
+    except Exception:
+        return Response(status_code=404)
+    ctype = blob.content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    body = b"" if request.method == "HEAD" else data
+    return Response(body, media_type=ctype, headers={"content-length": str(len(data)), "cache-control": "public, max-age=86400"})
 
 
 async def stage(url: str) -> str:
@@ -154,6 +179,8 @@ async def stage(url: str) -> str:
         r.raise_for_status()
     ctype = r.headers.get("content-type", "").split(";")[0] or "application/octet-stream"
     ext = mimetypes.guess_extension(ctype) or os.path.splitext(urlparse(url).path)[1] or ""
+    if ext == ".jpe":
+        ext = ".jpg"
     name = f"media/{datetime.now(timezone.utc):%Y%m%d}/{uuid.uuid4().hex}{ext}"
 
     def _upload() -> None:
@@ -439,6 +466,24 @@ async def whoami() -> dict:
 
 
 app = mcp.streamable_http_app()
+
+
+class _LearnBaseURL:
+    """Remember the service's public https URL from the first request it receives."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        global PUBLIC_BASE_URL
+        if scope["type"] == "http" and not PUBLIC_BASE_URL:
+            host = dict(scope["headers"]).get(b"host", b"").decode()
+            if host and not host.startswith(("localhost", "127.")):
+                PUBLIC_BASE_URL = f"https://{host}"
+        await self.inner(scope, receive, send)
+
+
+app = _LearnBaseURL(app)
 
 if __name__ == "__main__":
     import uvicorn
