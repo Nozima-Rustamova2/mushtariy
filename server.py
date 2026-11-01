@@ -37,10 +37,11 @@ STATE_BUCKET = BUCKET
 # Public base URL of this service, used to build media links Meta can fetch.
 # Learned from the first incoming request if not set.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-MCP_PATH_TOKEN = os.environ.get("MCP_PATH_TOKEN", "")  # secret path segment for the connector URL
+# Access code typed once on the /login page when connecting Claude. Kept in the private
+# bucket at config/mcp_path_token (env ACCESS_CODE overrides, for local testing).
+ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
 # Field Meta uses for the AI-generated disclosure. Kept configurable in case Meta renames it.
 AI_LABEL_PARAM = os.environ.get("AI_LABEL_PARAM", "is_ai_generated")
-
 
 
 def _state_bucket():
@@ -49,39 +50,57 @@ def _state_bucket():
     return storage.Client().bucket(STATE_BUCKET)
 
 
-def _bootstrap_path_token() -> str:
-    """The connector URL's secret segment. Generated once and kept in the private bucket
-    (config/mcp_path_token), so nobody has to type a secret anywhere. Rotate it by
-    deleting that object and restarting the service."""
+def _bootstrap_access_code() -> str:
+    """Generated once and kept in the private bucket. Rotate it by deleting
+    config/mcp_path_token and restarting the service (this also signs everyone out)."""
     if not STATE_BUCKET:
-        print("STATE_BUCKET not set; using a throwaway path token for this process.")
+        print("BUCKET not set; using a throwaway access code for this process.")
         return secrets.token_urlsafe(24)
     from google.api_core.exceptions import PreconditionFailed
 
     blob = _state_bucket().blob("config/mcp_path_token")
     try:
-        blob.upload_from_string(secrets.token_urlsafe(32), if_generation_match=0)
+        blob.upload_from_string(secrets.token_urlsafe(32), if_generation_match=0, content_type="text/plain")
     except PreconditionFailed:
         pass  # already exists
     return blob.download_as_text().strip()
 
 
-if not MCP_PATH_TOKEN:
-    MCP_PATH_TOKEN = _bootstrap_path_token()
+if not ACCESS_CODE:
+    ACCESS_CODE = _bootstrap_access_code()
+
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions  # noqa: E402
+
+from auth import SingleUserProvider  # noqa: E402
+
+_BASE = PUBLIC_BASE_URL or "http://localhost:8080"
+oauth = SingleUserProvider(ACCESS_CODE, _BASE, _state_bucket if STATE_BUCKET else None)
 
 mcp = FastMCP(
     name="mushtariy-instagram",
     instructions=(
         "Publishes to the Instagram account @mushtariy.beta (an openly AI virtual model). "
-        "Media must be a public URL; non-bucket URLs are copied to the project's bucket first. "
+        "Media must be a public URL; other URLs are copied to the project's private bucket first. "
         "Every post is labelled AI-generated automatically. Show the user the caption and "
         "media and get a clear yes before calling any publish_* or delete_post tool."
     ),
     host="0.0.0.0",
     stateless_http=True,
     json_response=True,
-    streamable_http_path=f"/mcp/{MCP_PATH_TOKEN}",
+    streamable_http_path="/mcp",
+    auth_server_provider=oauth,
+    auth=AuthSettings(
+        issuer_url=_BASE,
+        resource_server_url=f"{_BASE}/mcp",
+        validate_token_resource=False,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    ),
 )
+
+
+@mcp.custom_route("/login", methods=["GET", "POST"])
+async def login(request: Request):
+    return await oauth.login_page(request)
 
 
 class GraphError(RuntimeError):

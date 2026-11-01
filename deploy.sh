@@ -32,10 +32,11 @@ done
 
 gcloud run deploy mushtariy-mcp --source . --region=$REGION --service-account=$SA \
   --allow-unauthenticated --min-instances=0 --max-instances=1 --memory=512Mi --timeout=900 \
-  --set-env-vars=BUCKET=$BUCKET \
+  --set-env-vars=BUCKET=$BUCKET,PUBLIC_BASE_URL=PLACEHOLDER \
   --set-secrets=META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,IG_USER_ID=IG_USER_ID:latest
 
 URL=$(gcloud run services describe mushtariy-mcp --region=$REGION --format='value(status.url)')
+gcloud run services update mushtariy-mcp --region=$REGION --update-env-vars=PUBLIC_BASE_URL=$URL
 
 # Publish due scheduled posts every 5 minutes
 gcloud scheduler jobs describe mushtariy-queue --location=$REGION >/dev/null 2>&1 && \
@@ -44,6 +45,6 @@ gcloud scheduler jobs create http mushtariy-queue --location=$REGION --schedule=
   --uri="$URL/run-queue" --http-method=POST
 
 echo
-echo "Connector URL (keep private — it is the key):"
-curl -s "$URL/health" >/dev/null   # first request creates the path token
-echo "$URL/mcp/$(gcloud storage cat gs://$BUCKET/config/mcp_path_token)"
+echo "Connector URL:  $URL/mcp"
+echo "Access code (type it on the sign-in page; keep it private):"
+gcloud storage cat gs://$BUCKET/config/mcp_path_token; echo

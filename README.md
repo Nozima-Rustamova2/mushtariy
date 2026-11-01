@@ -9,9 +9,10 @@ An MCP server that lets Claude publish to **@mushtariy.beta** through Meta's off
 - Everything lives in one **private** bucket, `dresscode-social-media`:
   - `media/`: copies of every image and video. The service hands them to Meta at `<service-url>/m/<random-name>`; nothing in the bucket is public.
   - `queue/`: scheduled posts. Cloud Scheduler calls `/run-queue` every 5 minutes to publish whatever is due.
-  - `config/mcp_path_token`: the connector's secret path.
+  - `config/mcp_path_token`: the **access code** you type once when connecting Claude.
+  - `oauth/clients/`: the apps that have registered for sign-in (claude.ai).
 - Runs as the service account `mushtariy-mcp`. Secrets in Secret Manager: `META_ACCESS_TOKEN` and `IG_USER_ID`.
-- The connector URL is `<service-url>/mcp/<contents of gs://dresscode-social-media/config/mcp_path_token>`. To rotate it, delete that object and redeploy.
+- **Connector URL:** `<service-url>/mcp`. Claude registers itself and opens `/login`, where you type the access code once. Access tokens last 7 days and refresh automatically. Changing the access code (delete `config/mcp_path_token` and redeploy) signs everyone out.
 
 ## Setup (once)
 
@@ -24,6 +25,6 @@ An MCP server that lets Claude publish to **@mushtariy.beta** through Meta's off
    - Create the secret `IG_USER_ID` and paste the id into it.
    - Never paste either one into a chat.
 3. **Deploy.** Either run `bash deploy.sh` in Cloud Shell, or deploy through the console (Cloud Run → connect this repo, Dockerfile build) with env `BUCKET=dresscode-social-media` and the two secrets as env vars.
-4. **Connect it.** Add the printed URL in claude.ai under Settings → Connectors → Add custom connector.
+4. **Connect it.** In claude.ai, go to Settings → Connectors → Add custom connector and use `<service-url>/mcp`. Click Connect and enter the access code.
 
-The secret path in the URL is the only key. If it leaks, rotate it as described above.
+The access code is the only key. If it leaks, rotate it as described above.
