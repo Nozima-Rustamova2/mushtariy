@@ -160,8 +160,8 @@ async def serve_media(request: Request):
     name = request.path_params["name"]
     if ".." in name or not name:
         return Response(status_code=404)
-    blob = _state_bucket().blob(f"media/{name}")
     try:
+        blob = _state_bucket().blob(f"media/{name}")
         data = await asyncio.to_thread(blob.download_as_bytes)
     except Exception:
         return Response(status_code=404)
